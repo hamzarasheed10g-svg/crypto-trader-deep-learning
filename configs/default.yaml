@@ -1,0 +1,198 @@
+# =============================================================================
+# Hybrid LSTM-PPO Cryptocurrency Trading — Default Configuration
+# Single source of truth. Override via --config path/to/your.yaml on any script.
+# =============================================================================
+
+seed: 42
+device: auto
+
+paths:
+  raw_data_dir: data/raw
+  processed_data_dir: data/processed
+  artifacts_dir: artifacts
+  lstm_model: artifacts/lstm_model.pt
+  lstm_scaler: artifacts/lstm_scaler.pkl
+  ppo_model: artifacts/ppo_model.zip
+  ppo_vecnorm: artifacts/ppo_vecnorm.pkl
+  backtest_report: artifacts/backtest_report.html
+  metrics_json: artifacts/metrics.json
+
+# -----------------------------------------------------------------------------
+# Phase 1: Data Collection and Acquisition (Section 1.3)
+# -----------------------------------------------------------------------------
+data:
+  symbol: BTCUSDT
+  interval: 1h                  # 1m, 5m, 15m, 1h, 1d (Binance kline intervals)
+  years_of_history: 3
+  exchange: binance             # placeholder — extension hooks for coinbase/kraken
+  cache: true                   # cache raw klines locally to avoid re-fetching
+
+# -----------------------------------------------------------------------------
+# Phase 1 (continued): Preprocessing and Feature Engineering (Section 1.4)
+# -----------------------------------------------------------------------------
+preprocessing:
+  drop_duplicates: true
+  fill_method: linear           # 'linear' | 'ffill' | 'drop'
+  outlier_z_threshold: 8.0      # z-score above which we winsorise (not drop) price
+  normalize: zscore             # 'minmax' | 'zscore' | 'none' — zscore is more robust to
+                                # train/test distribution shift on trending price features
+  feature_list:
+    - open
+    - high
+    - low
+    - close
+    - volume
+    - rsi_14
+    - macd
+    - macd_signal
+    - macd_hist
+    - ema_12
+    - ema_26
+    - bb_upper
+    - bb_lower
+    - bb_width
+    - atr_14
+    - vwap
+    - log_return
+    - rolling_vol_24
+    # Directional / regime features (added 2026-05)
+    - return_1
+    - return_5
+    - return_24
+    - vol_ratio_6_48
+    - dist_ema_50
+    - hour_sin
+    - hour_cos
+
+# -----------------------------------------------------------------------------
+# Phase 2: LSTM Predictive Model (Section 1.5)
+# -----------------------------------------------------------------------------
+lstm:
+  sequence_length: 60           # past timesteps used to predict the next
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.2
+  bidirectional: false
+  prediction_target: dual       # 'log_return' | 'close' | 'direction' | 'dual'
+  prediction_horizon: 1         # predict t+1
+  loss:
+    # Dual-head loss weighting. Total loss = alpha_regression * MSE + alpha_direction * BCE.
+    # Higher alpha_direction makes the model prioritise getting up/down right over
+    # getting the magnitude right — better for a discrete-action trading agent.
+    alpha_regression: 0.5
+    alpha_direction: 0.5
+  split:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+  training:
+    batch_size: 64
+    epochs: 30
+    learning_rate: 1.0e-3
+    weight_decay: 1.0e-5
+    grad_clip: 1.0
+    early_stopping_patience: 5
+    scheduler: cosine           # 'cosine' | 'plateau' | 'none'
+
+# -----------------------------------------------------------------------------
+# Phase 3+: DRL Trading Environment (Section 1.6) & PPO Agent (Section 1.7)
+# -----------------------------------------------------------------------------
+env:
+  initial_balance: 10000.0
+  fee_rate: 0.001               # 0.10% per trade (Binance taker fee)
+  slippage_bps: 5.0             # 5 basis points per fill
+  max_position_fraction: 1.0    # max fraction of equity in BTC at any time
+  window_size: 60               # observation window matches LSTM sequence_length
+  reward:
+    type: differential_sharpe   # 'log_return' | 'differential_sharpe' | 'pnl'
+    sharpe_eta: 0.01            # EWMA decay for differential Sharpe
+    drawdown_penalty: 0.5       # multiplier on intra-episode drawdown
+    holding_penalty: 0.0001     # tiny penalty per step to discourage do-nothing
+  action_space: discrete        # 'discrete' (Buy/Sell/Hold) | 'continuous'
+
+ppo:
+  total_timesteps: 500_000
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  learning_rate: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2               # epsilon in Eq. 1.7 of the methodology
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  policy: MlpPolicy
+  policy_kwargs:
+    net_arch:
+      - 128
+      - 128
+  eval_freq: 10_000
+  n_eval_episodes: 5
+
+# -----------------------------------------------------------------------------
+# Risk Management (Section 1.9)
+# -----------------------------------------------------------------------------
+risk:
+  stop_loss_pct: 0.02           # 2% adverse move closes position
+  take_profit_pct: 0.05         # 5% favourable move locks in profit
+  max_drawdown_pct: 0.15        # 15% portfolio drawdown halts trading
+  max_position_fraction: 1.0
+  min_trade_notional: 10.0      # USDT — Binance minimum
+  cooldown_bars: 0              # bars to wait after a stopped-out trade
+
+# -----------------------------------------------------------------------------
+# Phase 6: Backtesting (Section 1.12)
+# -----------------------------------------------------------------------------
+backtest:
+  baselines:
+    - buy_and_hold
+    - sma_crossover
+    - momentum
+  sma_fast: 20
+  sma_long: 50
+  momentum_lookback: 14
+  risk_free_rate: 0.0           # annualised, for Sharpe
+  bars_per_year: 8760           # 1h bars => 24*365
+
+# -----------------------------------------------------------------------------
+# Phase 7: Real-Time Deployment (Section 1.13)
+# -----------------------------------------------------------------------------
+deploy:
+  paper_trading: true           # always true on testnet
+  warmup_bars: 60               # collect this many bars before first action
+  max_runtime_minutes: null     # null = run forever
+  log_every_n_bars: 1
+  latency_target_ms: 100        # methodology target
+
+# -----------------------------------------------------------------------------
+# Live-trading decision policy (honest version — see live_trader.py)
+# -----------------------------------------------------------------------------
+# These thresholds gate when the live trader will actually enter or exit a
+# position. They replace the hard-coded "force a trade every N bars" overrides
+# in the previous version. With these defaults the trader genuinely HOLDs
+# whenever the model lacks conviction, which is the correct behaviour for
+# anything other than a rigged demo.
+live:
+  # Probability threshold from the classification head (P(up)).
+  # Enter long when P(up) >= prob_up_buy AND regression head also predicts up
+  # by at least pred_buy_threshold log-return points.
+  prob_up_buy: 0.55             # 55% confidence on direction before buying
+  prob_up_sell: 0.45            # below 45% confidence -> exit long
+  pred_buy_threshold: 0.0       # log-return floor for a BUY (0 = any positive)
+  pred_sell_threshold: 0.0      # log-return ceiling for a SELL (0 = any negative)
+  # Minimum holding period in bars (prevents instant flip-flopping when the
+  # signal is borderline). Set to 0 to disable.
+  min_hold_bars: 0
+  # If true, broadcast a decision record on every bar (including HOLDs) so
+  # the dashboard can show the model's reasoning at all times.
+  broadcast_holds: true
+  # Rolling window over which to compute "recent directional accuracy" — used
+  # purely as a confidence diagnostic shown to the user, never to gate trades.
+  accuracy_window: 50
+
+backend:
+  host: 0.0.0.0
+  port: 8000
+  cors_allow_origins:
+    - "*"

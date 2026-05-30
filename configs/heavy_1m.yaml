@@ -1,0 +1,163 @@
+# =============================================================================
+# Hybrid LSTM-PPO — HEAVY 1m RETRAIN CONFIG
+# 1m bars, 180 days of history, larger model + extended PPO training
+# Expected training time on CPU: ~3-6 hours total
+# Use: python -m scripts.phase1_fetch_data --config configs/heavy_1m.yaml
+# =============================================================================
+
+seed: 42
+device: auto
+
+paths:
+  raw_data_dir: data/raw
+  processed_data_dir: data/processed
+  artifacts_dir: artifacts
+  lstm_model: artifacts/lstm_model.pt
+  lstm_scaler: artifacts/lstm_scaler.pkl
+  ppo_model: artifacts/ppo_model.zip
+  ppo_vecnorm: artifacts/ppo_vecnorm.pkl
+  backtest_report: artifacts/backtest_report.html
+  metrics_json: artifacts/metrics.json
+
+# -----------------------------------------------------------------------------
+# Phase 1: Data Collection (Section 1.3)
+# Switched to 1m for fine-grained trading patterns
+# 180 days * 24 * 60 ≈ 259,200 bars
+# -----------------------------------------------------------------------------
+data:
+  symbol: BTCUSDT
+  interval: 1m                  # CHANGED: train on the same timeframe we trade
+  years_of_history: 0.5         # 180 days
+  exchange: binance
+  cache: true
+
+# -----------------------------------------------------------------------------
+# Preprocessing (Section 1.4)
+# -----------------------------------------------------------------------------
+preprocessing:
+  drop_duplicates: true
+  fill_method: linear
+  outlier_z_threshold: 8.0
+  normalize: minmax
+  feature_list:
+    - open
+    - high
+    - low
+    - close
+    - volume
+    - rsi_14
+    - macd
+    - macd_signal
+    - macd_hist
+    - ema_12
+    - ema_26
+    - bb_upper
+    - bb_lower
+    - bb_width
+    - atr_14
+    - vwap
+    - log_return
+    - rolling_vol_24
+
+# -----------------------------------------------------------------------------
+# Phase 2: LSTM (Section 1.5) — BIGGER + LONGER TRAINING
+# -----------------------------------------------------------------------------
+lstm:
+  sequence_length: 120          # 2 hours of context per prediction (was 60)
+  hidden_size: 256              # doubled from 128 — more capacity for fine patterns
+  num_layers: 3                 # one more layer for hierarchical feature learning
+  dropout: 0.25                 # slightly higher to combat overfitting on more data
+  bidirectional: false
+  prediction_target: log_return
+  prediction_horizon: 1         # predict next 1m bar return
+  split:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+  training:
+    batch_size: 256             # bigger batches for stable gradients on large data
+    epochs: 50                  # was 30 — more epochs + early stopping protects us
+    learning_rate: 5.0e-4       # lower LR for the larger model
+    weight_decay: 1.0e-5
+    grad_clip: 1.0
+    early_stopping_patience: 7
+    scheduler: cosine
+
+# -----------------------------------------------------------------------------
+# Phase 3+: DRL Environment (Section 1.6) & PPO Agent (Section 1.7)
+# -----------------------------------------------------------------------------
+env:
+  initial_balance: 10000.0
+  fee_rate: 0.001               # 0.10% Binance taker
+  slippage_bps: 5.0
+  max_position_fraction: 1.0
+  window_size: 120              # match LSTM sequence_length
+  reward:
+    type: differential_sharpe
+    sharpe_eta: 0.01
+    drawdown_penalty: 0.5
+    holding_penalty: 0.001      # 10x stronger penalty on HOLD — encourages trading
+  action_space: discrete
+
+# PPO scaled up for 1m trading
+ppo:
+  total_timesteps: 2_000_000    # 4x more than 1h config — much richer training
+  n_steps: 4096                 # bigger rollout per update
+  batch_size: 256
+  n_epochs: 10
+  learning_rate: 2.5e-4
+  gamma: 0.995                  # higher discount for shorter bars (longer horizon in real time)
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.02                # higher entropy bonus — more exploration, more BUY/SELL actions
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  policy: MlpPolicy
+  policy_kwargs:
+    net_arch:
+      - 256                     # bigger policy network to match LSTM
+      - 256
+      - 128
+  eval_freq: 20_000
+  n_eval_episodes: 5
+
+# -----------------------------------------------------------------------------
+# Risk (Section 1.9) — tighter for 1m
+# -----------------------------------------------------------------------------
+risk:
+  stop_loss_pct: 0.008          # 0.8% — was 2%, but 1m moves are smaller
+  take_profit_pct: 0.015        # 1.5% — was 5%
+  max_drawdown_pct: 0.15
+  max_position_fraction: 1.0
+  min_trade_notional: 10.0
+  cooldown_bars: 2              # 2-min cooldown after stopout
+
+# -----------------------------------------------------------------------------
+# Backtesting (Section 1.12)
+# -----------------------------------------------------------------------------
+backtest:
+  baselines:
+    - buy_and_hold
+    - sma_crossover
+    - momentum
+  sma_fast: 30                  # 30 min
+  sma_long: 120                 # 2 hours
+  momentum_lookback: 30
+  risk_free_rate: 0.0
+  bars_per_year: 525600         # 1m bars => 365*24*60
+
+# -----------------------------------------------------------------------------
+# Deployment (Section 1.13)
+# -----------------------------------------------------------------------------
+deploy:
+  paper_trading: true
+  warmup_bars: 120
+  max_runtime_minutes: null
+  log_every_n_bars: 1
+  latency_target_ms: 100
+
+backend:
+  host: 0.0.0.0
+  port: 8000
+  cors_allow_origins:
+    - "*"

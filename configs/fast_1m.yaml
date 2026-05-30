@@ -1,0 +1,159 @@
+# =============================================================================
+# Hybrid LSTM-PPO - FAST 1m RETRAIN CONFIG
+# 1m bars, 90 days of history, leaner model, faster convergence
+# Expected total time on CPU: ~2-3 hours
+# Use: python -m scripts.phase1_fetch_data --config configs/fast_1m.yaml
+# =============================================================================
+
+seed: 42
+device: auto
+
+paths:
+  raw_data_dir: data/raw
+  processed_data_dir: data/processed
+  artifacts_dir: artifacts
+  lstm_model: artifacts/lstm_model.pt
+  lstm_scaler: artifacts/lstm_scaler.pkl
+  ppo_model: artifacts/ppo_model.zip
+  ppo_vecnorm: artifacts/ppo_vecnorm.pkl
+  backtest_report: artifacts/backtest_report.html
+  metrics_json: artifacts/metrics.json
+
+# -----------------------------------------------------------------------------
+# Phase 1: Data - 90 days of 1m = ~130k bars. Enough signal, half the disk I/O.
+# -----------------------------------------------------------------------------
+data:
+  symbol: BTCUSDT
+  interval: 1m
+  years_of_history: 0.25       # 90 days
+  exchange: binance
+  cache: true
+
+# -----------------------------------------------------------------------------
+# Preprocessing
+# -----------------------------------------------------------------------------
+preprocessing:
+  drop_duplicates: true
+  fill_method: linear
+  outlier_z_threshold: 8.0
+  normalize: minmax
+  feature_list:
+    - open
+    - high
+    - low
+    - close
+    - volume
+    - rsi_14
+    - macd
+    - macd_signal
+    - macd_hist
+    - ema_12
+    - ema_26
+    - bb_upper
+    - bb_lower
+    - bb_width
+    - atr_14
+    - vwap
+    - log_return
+    - rolling_vol_24
+
+# -----------------------------------------------------------------------------
+# LSTM - leaner: 64 hidden, 2 layers, 60-bar window. ~5-8 min/epoch on CPU.
+# -----------------------------------------------------------------------------
+lstm:
+  sequence_length: 60          # 1 hour of context (down from 120)
+  hidden_size: 64              # down from 256 - main speedup
+  num_layers: 2                # down from 3
+  dropout: 0.2
+  bidirectional: false
+  prediction_target: log_return
+  prediction_horizon: 1
+  split:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+  training:
+    batch_size: 512            # bigger batch = fewer steps per epoch
+    epochs: 12                 # plenty with early stopping
+    learning_rate: 1.0e-3      # back to typical rate for the smaller model
+    weight_decay: 1.0e-5
+    grad_clip: 1.0
+    early_stopping_patience: 3 # stop fast if val loss plateaus
+    scheduler: cosine
+
+# -----------------------------------------------------------------------------
+# Environment & PPO - fewer timesteps, smaller policy, faster rollouts
+# -----------------------------------------------------------------------------
+env:
+  initial_balance: 10000.0
+  fee_rate: 0.001
+  slippage_bps: 5.0
+  max_position_fraction: 1.0
+  window_size: 60              # match LSTM
+  reward:
+    type: differential_sharpe
+    sharpe_eta: 0.01
+    drawdown_penalty: 0.5
+    holding_penalty: 0.001     # 10x stronger - encourages active trading
+  action_space: discrete
+
+ppo:
+  total_timesteps: 400_000     # down from 2M but still meaningful
+  n_steps: 2048
+  batch_size: 128
+  n_epochs: 8                  # down from 10
+  learning_rate: 3.0e-4
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.02               # high entropy = more BUY/SELL exploration
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  policy: MlpPolicy
+  policy_kwargs:
+    net_arch:
+      - 128
+      - 128
+  eval_freq: 20_000
+  n_eval_episodes: 3
+
+# -----------------------------------------------------------------------------
+# Risk - tighter bands appropriate for 1m moves
+# -----------------------------------------------------------------------------
+risk:
+  stop_loss_pct: 0.008
+  take_profit_pct: 0.015
+  max_drawdown_pct: 0.15
+  max_position_fraction: 1.0
+  min_trade_notional: 10.0
+  cooldown_bars: 2
+
+# -----------------------------------------------------------------------------
+# Backtesting
+# -----------------------------------------------------------------------------
+backtest:
+  baselines:
+    - buy_and_hold
+    - sma_crossover
+    - momentum
+  sma_fast: 30
+  sma_long: 120
+  momentum_lookback: 30
+  risk_free_rate: 0.0
+  bars_per_year: 525600
+
+# -----------------------------------------------------------------------------
+# Deployment
+# -----------------------------------------------------------------------------
+deploy:
+  paper_trading: true
+  warmup_bars: 60
+  max_runtime_minutes: null
+  log_every_n_bars: 1
+  latency_target_ms: 100
+
+backend:
+  host: 0.0.0.0
+  port: 8000
+  cors_allow_origins:
+    - "*"
